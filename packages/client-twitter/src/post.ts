@@ -27,31 +27,54 @@ import {
 } from "discord.js";
 import { State } from "@elizaos/core";
 import { ActionResponse } from "@elizaos/core";
+import { ProjectUpdateService } from "./projectUpdates.ts";
 
 const MAX_TIMELINES_TO_FETCH = 15;
 
 const twitterPostTemplate = `
-# Areas of Expertise
-{{knowledge}}
+# Context
+You are generating a post in {{language}} as a professional market analyst.
 
-# About {{agentName}} (@{{twitterUserName}}):
-{{bio}}
-{{lore}}
-{{topics}}
+# Professional Guidelines
+- Present controversial but well-reasoned market perspectives
+- Challenge common assumptions with data
+- Pose thought-provoking questions
+- Present contrarian viewpoints backed by analysis
+- Highlight potential market inefficiencies
+- Identify overlooked market signals
+- Compare different analytical frameworks
 
-{{providers}}
+# Content Structure
+1. Start with a strong observation or thesis
+2. Present supporting evidence or analysis
+3. Challenge conventional wisdom
+4. End with an open-ended question or discussion point
 
-{{characterPostExamples}}
+# Task
+Write a post about {{topic}} that encourages intellectual discourse.
 
-{{postDirections}}
+Requirements:
+- Use formal, analytical language
+- Focus on market dynamics and technical analysis
+- Present contrarian views supported by data
+- Highlight potential risks or opportunities
+- End with a discussion prompt
+- No emojis or informal language
+- No terms like "ser", "gm", "wagmi"
+- Maintain professional credibility
+- Keep under 280 characters
 
-# Task: Generate a post in the voice and style and perspective of {{agentName}} @{{twitterUserName}}.
-Write a post that is {{adjective}} about {{topic}} (without mentioning {{topic}} directly), from the perspective of {{agentName}}. Do not add commentary or acknowledge this request, just write the post.
-Your response should be 1, 2, or 3 sentences (choose the length at random).
-Your response should not contain any questions. Brief, concise statements only. The total character count MUST be less than {{maxTweetLength}}. No emojis. Use \\n\\n (double spaces) between statements if there are multiple statements in your response.`;
+Example formats:
+- "Market assumption X is flawed because of Y. Data shows Z instead. Thoughts?"
+- "Analyzing recent [event]: conventional wisdom suggests X, but on-chain data indicates Y"
+- "Key insight from [analysis]: X contradicts popular belief Y. What are we missing?"
+- "Unpopular opinion backed by data: [thesis]. Here's why this matters for [market]"`;
 
 export const twitterActionTemplate =
     `
+# Context
+The following tweet is in {{language}}. Please respond in the same language.
+
 # INSTRUCTIONS: Determine actions for {{agentName}} (@{{twitterUserName}}) based on:
 {{bio}}
 {{postDirections}}
@@ -101,6 +124,7 @@ export class TwitterPostClient {
     private approvalRequired: boolean = false;
     private discordApprovalChannelId: string;
     private approvalCheckInterval: number;
+    private projectUpdateService: ProjectUpdateService;
 
     constructor(client: ClientBase, runtime: IAgentRuntime) {
         this.client = client;
@@ -173,6 +197,9 @@ export class TwitterPostClient {
             // Set up Discord client event handlers
             this.setupDiscordClient();
         }
+
+        // 初始化项目更新服务
+        this.projectUpdateService = new ProjectUpdateService(client, runtime);
     }
 
     private setupDiscordClient() {
@@ -226,9 +253,7 @@ export class TwitterPostClient {
             const lastPostTimestamp = lastPost?.timestamp ?? 0;
             const minMinutes = this.client.twitterConfig.POST_INTERVAL_MIN;
             const maxMinutes = this.client.twitterConfig.POST_INTERVAL_MAX;
-            const randomMinutes =
-                Math.floor(Math.random() * (maxMinutes - minMinutes + 1)) +
-                minMinutes;
+            const randomMinutes =Math.floor(Math.random() * (maxMinutes - minMinutes + 1)) + minMinutes;
             const delay = randomMinutes * 60 * 1000;
 
             if (Date.now() > lastPostTimestamp + delay) {
@@ -289,6 +314,9 @@ export class TwitterPostClient {
 
         // Start the pending tweet check loop if enabled
         if (this.approvalRequired) this.runPendingTweetCheckLoop();
+
+        // 启动项目更新服务
+        await this.projectUpdateService.start();
     }
 
     private runPendingTweetCheckLoop() {
@@ -472,6 +500,7 @@ export class TwitterPostClient {
             );
 
             const topics = this.runtime.character.topics.join(", ");
+            const detectedLanguage = await this.detectLanguage(topics);
 
             const state = await this.runtime.composeState(
                 {
@@ -485,6 +514,7 @@ export class TwitterPostClient {
                 },
                 {
                     twitterUserName: this.client.profile.username,
+                    language: detectedLanguage,
                 }
             );
 
@@ -495,86 +525,56 @@ export class TwitterPostClient {
                     twitterPostTemplate,
             });
 
-            elizaLogger.debug("generate post prompt:\n" + context);
-
             const newTweetContent = await generateText({
                 runtime: this.runtime,
                 context,
                 modelClass: ModelClass.SMALL,
             });
 
-            // First attempt to clean content
-            let cleanedContent = "";
+            // 修改 cleanedContent 的处理方式
+            let cleanedContent = newTweetContent
+                .replace(/^\s*{?\s*"text":\s*"|"\s*}?\s*$/g, "") // Remove JSON-like wrapper
+                .replace(/^['"](.*)['"]$/g, "$1") // Remove quotes
+                .replace(/\\"/g, '"') // Unescape quotes
+                .replace(/\.\s+/g, ". ") // 修改这里：将多个空格替换为单个空格
+                .replace(/\s{2,}/g, " ") // 确保所有多个空格变成单个空格
+                .trim();
 
-            // Try parsing as JSON first
+            // 如果内容是 JSON 格式，尝试解析
             try {
-                const parsedResponse = JSON.parse(newTweetContent);
-                if (parsedResponse.text) {
-                    cleanedContent = parsedResponse.text;
-                } else if (typeof parsedResponse === "string") {
-                    cleanedContent = parsedResponse;
+                const parsed = JSON.parse(cleanedContent);
+                if (parsed.text) {
+                    cleanedContent = parsed.text;
                 }
-            } catch (error) {
-                error.linted = true; // make linter happy since catch needs a variable
-                // If not JSON, clean the raw content
-                cleanedContent = newTweetContent
-                    .replace(/^\s*{?\s*"text":\s*"|"\s*}?\s*$/g, "") // Remove JSON-like wrapper
-                    .replace(/^['"](.*)['"]$/g, "$1") // Remove quotes
-                    .replace(/\\"/g, '"') // Unescape quotes
-                    .replace(/\\n/g, "\n\n") // Unescape newlines, ensures double spaces
-                    .trim();
+            } catch (e) {
+                // 如果不是 JSON 格式，使用原始清理后的内容
             }
 
+            // 确保内容不会被分割
+            cleanedContent = cleanedContent
+                .replace(/\n/g, " ")
+                .replace(/\r/g, " ")
+                .replace(/\s{2,}/g, " ")
+                .trim();
+
             if (!cleanedContent) {
-                elizaLogger.error(
-                    "Failed to extract valid content from response:",
-                    {
-                        rawResponse: newTweetContent,
-                        attempted: "JSON parsing",
-                    }
-                );
+                elizaLogger.error("Failed to generate valid content");
                 return;
             }
 
-            // Truncate the content to the maximum tweet length specified in the environment settings, ensuring the truncation respects sentence boundaries.
-            const maxTweetLength = this.client.twitterConfig.MAX_TWEET_LENGTH;
-            if (maxTweetLength) {
-                cleanedContent = truncateToCompleteSentence(
-                    cleanedContent,
-                    maxTweetLength
-                );
-            }
-
-            const removeQuotes = (str: string) =>
-                str.replace(/^['"](.*)['"]$/, "$1");
-
-            const fixNewLines = (str: string) => str.replaceAll(/\\n/g, "\n\n"); //ensures double spaces
-
-            // Final cleaning
-            cleanedContent = removeQuotes(fixNewLines(cleanedContent));
-
             if (this.isDryRun) {
-                elizaLogger.info(
-                    `Dry run: would have posted tweet: ${cleanedContent}`
-                );
+                elizaLogger.info(`Dry run: would have posted tweet: ${cleanedContent}`);
                 return;
             }
 
             try {
                 if (this.approvalRequired) {
-                    // Send for approval instead of posting directly
-                    elizaLogger.log(
-                        `Sending Tweet For Approval:\n ${cleanedContent}`
-                    );
-                    await this.sendForApproval(
-                        cleanedContent,
-                        roomId,
-                        newTweetContent
-                    );
+                    elizaLogger.log(`Sending Tweet For Approval:\n ${cleanedContent}`);
+                    await this.sendForApproval(cleanedContent, roomId, newTweetContent);
                     elizaLogger.log("Tweet sent for approval");
                 } else {
                     elizaLogger.log(`Posting new tweet:\n ${cleanedContent}`);
-                    this.postTweet(
+                    await this.postTweet(
                         this.runtime,
                         this.client,
                         cleanedContent,
@@ -1196,6 +1196,8 @@ export class TwitterPostClient {
 
     async stop() {
         this.stopProcessingActions = true;
+        // 停止项目更新服务
+        await this.projectUpdateService.stop();
     }
 
     private async sendForApproval(
@@ -1447,5 +1449,16 @@ export class TwitterPostClient {
                 }
             }
         }
+    }
+
+    private async detectLanguage(text: string): Promise<string> {
+        // 这里可以使用简单的语言检测逻辑
+        // 例如检查是否包含中文字符
+        const hasChinese = /[\u4e00-\u9fa5]/.test(text);
+        if (hasChinese) {
+            return "Chinese";
+        }
+        // 可以添加其他语言的检测
+        return "English"; // 默认返回英语
     }
 }

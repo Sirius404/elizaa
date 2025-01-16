@@ -745,6 +745,7 @@ export type Character = {
         discordMessageHandlerTemplate?: TemplateType;
         slackMessageHandlerTemplate?: TemplateType;
         slackShouldRespondTemplate?: TemplateType;
+        projectIntroductionTemplate?: TemplateType;
     };
 
     /** Character biography */

@@ -46,7 +46,7 @@ import {
     IVerifiableInferenceAdapter,
     VerifiableInferenceOptions,
     VerifiableInferenceResult,
-    //VerifiableInferenceProvider,
+    VerifiableInferenceProvider,
     TelemetrySettings,
     TokenizerType,
 } from "./types.ts";
@@ -417,7 +417,7 @@ export async function generateText({
                 elizaLogger.debug("Initializing OpenAI model with Cloudflare check");
                 const baseURL = getCloudflareGatewayBaseURL(runtime, 'openai') || endpoint;
 
-                //elizaLogger.debug("OpenAI baseURL result:", { baseURL });
+                elizaLogger.debug("OpenAI baseURL result:", { baseURL });
                 const openai = createOpenAI({
                     apiKey,
                     baseURL,
@@ -442,7 +442,7 @@ export async function generateText({
                 });
 
                 response = openaiResponse;
-                console.log("Received response from OpenAI model.");
+                console.log("Received response from OpenAI model.", openaiResponse);
                 break;
             }
 
@@ -2038,7 +2038,7 @@ async function handleGroq({
     const baseURL = getCloudflareGatewayBaseURL(runtime, 'groq');
     elizaLogger.debug("Groq handleGroq baseURL:", { baseURL });
 
-    const groq = createGroq({ apiKey, baseURL });
+    const groq = createGroq({ apiKey, fetch: runtime.fetch, baseURL });
     return await aiGenerateObject({
         model: groq.languageModel(model),
         schema,
@@ -2263,3 +2263,229 @@ export async function generateTweetActions({
         retryDelay *= 2;
     }
 }
+
+/**
+ * 从文本中识别加密项目名称
+ * @param {Object} options - 配置选项
+ * @param {IAgentRuntime} options.runtime - 运行时环境
+ * @param {string} options.context - 需要分析的文本内容
+ * @param {ModelClass} options.modelClass - 使用的模型类别
+ * @returns {Promise<Array<{name: string, confidence: number, details?: any}>>} 返回识别到的项目名称及置信度
+ */
+export async function identifyProject({
+    runtime,
+    context,
+    modelClass,
+}: {
+    runtime: IAgentRuntime;
+    context: string;
+    modelClass: ModelClass;
+}): Promise<Array<{name: string, confidence: number, details?: any}>> {
+    if (!context) {
+        elizaLogger.error("identifyProject context is empty");
+        return [];
+    }
+
+    const projectIdentificationPrompt = `
+Analyze the following text and identify any mentioned cryptocurrency project names. Cryptocurrency project names may appear in the following forms:
+1. Names starting with @ (e.g., @movementlabsxyz)
+2. Names following the pattern "xx Protocol" or "xx Chain" (e.g., Ethereum Protocol or Solana Chain)
+3. Common cryptocurrency names (e.g., Bitcoin, Ethereum)
+4. Abbreviations or tickers (e.g., BTC for Bitcoin, ETH for Ethereum)
+
+Requirements:
+- Identify projects based on relevance to blockchain, crypto, DeFi, NFTs, GameFi and related fields
+- For abbreviations/tickers, return the full project name (e.g., BTC -> Bitcoin)
+- Return JSON array of objects with:
+  - name: Project name (string)
+  - confidence: Score from 0-1 indicating mention clarity and relevance
+- Return empty array [] if no projects found
+
+Example:
+[
+    {"name": "Bitcoin", "confidence": 0.95},
+    {"name": "Ethereum", "confidence": 0.8}
+]
+
+Text to analyze:
+${context}
+
+Note: Return only JSON array, no additional text.
+`
+
+    let retryDelay = 1000;
+    const maxRetries = 1;
+    let currentRetry = 0;
+
+    while (currentRetry < maxRetries) {
+        try {
+            elizaLogger.log("projectIdentificationPrompt:", projectIdentificationPrompt);
+            const response = await generateText({
+                runtime,
+                context: projectIdentificationPrompt,
+                modelClass,
+            });
+            
+            // 添加更详细的日志
+            elizaLogger.debug("原始响应:", response);
+            
+            const trimmedResponse = response.trim();
+            elizaLogger.debug("处理后的响应:", trimmedResponse);
+            
+            let parsedResponse;
+            try {
+                parsedResponse = parseJsonArrayFromText(trimmedResponse);
+                elizaLogger.debug("解析后的响应:", parsedResponse);
+            } catch (parseError) {
+                elizaLogger.error("JSON解析错误:", parseError);
+                currentRetry++;
+                continue;
+            }
+            
+            if (parsedResponse && Array.isArray(parsedResponse)) {
+                const validProjects = [];
+                
+                for (const item of parsedResponse) {
+                    elizaLogger.debug("正在验证项目:", item);
+                    
+                    if (typeof item === 'object' &&
+                        item !== null &&
+                        typeof item.name === 'string' &&
+                        typeof item.confidence === 'number' &&
+                        item.confidence >= 0 &&
+                        item.confidence <= 1) {
+                        
+                        elizaLogger.debug("项目验证通过，获取详情:", item.name);
+                        const details = await getProjectDetails(item.name, runtime);
+                        validProjects.push({
+                            ...item,
+                            details
+                        });
+                    } else {
+                        elizaLogger.debug("项目验证失败:", {
+                            isObject: typeof item === 'object',
+                            notNull: item !== null,
+                            nameIsString: typeof item?.name === 'string',
+                            confidenceIsNumber: typeof item?.confidence === 'number',
+                            confidenceInRange: item?.confidence >= 0 && item?.confidence <= 1
+                        });
+                    }
+                }
+
+                if (validProjects.length > 0) {
+                    elizaLogger.debug("找到有效项目:", validProjects);
+                    return validProjects;
+                }
+            }
+
+            elizaLogger.warn("未找到有效项目，响应格式:", parsedResponse);
+            currentRetry++;
+            
+        } catch (error) {
+            elizaLogger.error("项目识别过程中出错:", error);
+            currentRetry++;
+        }
+
+        if (currentRetry < maxRetries) {
+            await new Promise(resolve => setTimeout(resolve, retryDelay));
+            retryDelay *= 2;
+        }
+    }
+
+    elizaLogger.error("项目识别达到最大重试次数");
+    return [];
+}
+
+
+/**
+ * 使用 RootData API 获取项目详细信息
+ * @param projectName 项目名称
+ * @param runtime 运行时环境
+ * @returns 项目详细信息
+ */
+export async function getProjectDetails(projectName: string, runtime: IAgentRuntime) {
+    try {
+        const apiKey = 'XQOWfLvZnP8z4U80gZk7cSF424Ekf3y4'
+        if (!apiKey) {
+            throw new Error('ROOTDATA_API_KEY not found');
+        }
+        elizaLogger.debug("getProjectDetails projectName: ", projectName);
+        // 1. 搜索项目
+        const searchResponse = await fetch('https://api.rootdata.com/open/ser_inv', {
+            method: 'POST',
+            headers: {
+                'apikey': apiKey,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                query: projectName
+            })
+        });
+
+        const searchData = await searchResponse.json();
+        
+        if (searchData.result !== 200 || !searchData.data?.length) {
+            return null;
+        }
+
+        // 2. 获取项目详情
+        const projectId = searchData.data[0].id;
+        const detailResponse = await fetch('https://api.rootdata.com/open/get_item', {
+            method: 'POST',
+            headers: {
+                'apikey': apiKey,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                project_id: projectId,
+                include_team: true,
+                include_investors: true
+            })
+        });
+
+        const detailData = await detailResponse.json();
+        
+        if (detailData.result === 200) {
+            return detailData.data;
+        }
+
+        return null;
+
+    } catch (error) {
+        elizaLogger.error("获取项目详情时出错:", error);
+        return null;
+    }
+}
+
+const projectIntroductionTemplate = `
+# About {{agentName}}:
+{{bio}}
+{{knowledge}}
+
+# Project Information:
+Project Name: {{projectName}}
+Description: {{projectDescription}}
+Tags: {{projectTags}}
+Market Cap: {{marketCap}}
+Recent Heat Score: {{heatScore}}
+
+# Task: Generate a concise and informative tweet about this project that:
+1. Highlights key features and recent developments
+2. Includes relevant metrics (market cap, popularity)
+3. Maintains a neutral, analytical tone
+4. Uses clear, professional language
+5. Stays under {{maxTweetLength}} characters
+
+Format Guidelines:
+- Start with project name in $SYMBOL format if available
+- Use line breaks (\\n) for readability
+- Include key metrics in parentheses
+- No hashtags or emojis
+- End with a fact-based observation
+
+Example:
+$XYZ continues building their L2 scaling solution\\n
+(Market Cap: $100M | Heat Score: 95)\\n
+Recent milestone: 1M daily transactions achieved
+
+Remember: Focus on facts, avoid speculation or promotion.`;

@@ -5,6 +5,7 @@ import { TwitterInteractionClient } from "./interactions.ts";
 import { TwitterPostClient } from "./post.ts";
 import { TwitterSearchClient } from "./search.ts";
 import { TwitterSpaceClient } from "./spaces.ts";
+import { TwitterClient } from "./base.ts";
 
 /**
  * A manager that orchestrates all specialized Twitter logic:
@@ -15,7 +16,7 @@ import { TwitterSpaceClient } from "./spaces.ts";
  * - space: launching and managing Twitter Spaces (optional)
  */
 class TwitterManager {
-    client: ClientBase;
+    client: TwitterClient;
     post: TwitterPostClient;
     search: TwitterSearchClient;
     interaction: TwitterInteractionClient;
@@ -23,7 +24,7 @@ class TwitterManager {
 
     constructor(runtime: IAgentRuntime, twitterConfig: TwitterConfig) {
         // Pass twitterConfig to the base client
-        this.client = new ClientBase(runtime, twitterConfig);
+        this.client = new TwitterClient(runtime, twitterConfig);
 
         // Posting logic
         this.post = new TwitterPostClient(this.client, runtime);

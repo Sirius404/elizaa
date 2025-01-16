@@ -83,7 +83,7 @@ class RequestQueue {
     }
 }
 
-export class ClientBase extends EventEmitter {
+export abstract class ClientBase extends EventEmitter {
     static _twitterClients: { [accountIdentifier: string]: Scraper } = {};
     twitterClient: Scraper;
     runtime: IAgentRuntime;
@@ -762,4 +762,12 @@ export class ClientBase extends EventEmitter {
             throw error;
         }
     }
+
+    async postTweet(content: string): Promise<void> {
+        await this.twitterClient.sendTweet("test");
+    }
+}
+
+export class TwitterClient extends ClientBase {
+    // 继承所有基类功能，不需要额外实现
 }
